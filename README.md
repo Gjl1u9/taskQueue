@@ -49,7 +49,7 @@ if leased:
     broker.ack(task_id, token)  # returns False if lease expired and another worker took over
 ```
 
----
+
 
 ## Core mental model: Delivery vs. Side effects
 
@@ -59,7 +59,7 @@ if leased:
 | **Queue state** | **Fenced** | Every lease increments `fencing_token`. Stale workers cannot `ack`, `fail`, or `heartbeat` a task that was re-leased to someone else. |
 | **Downstream effect** | **Exactly-once** *(with idempotency)* | A paused worker might already have written to an external DB *before* losing its lease. `ledger.py` demonstrates why downstream systems need an idempotent `dedupe` key in addition to fencing tokens. |
 
----
+
 
 ## How the state machine works
 
@@ -73,7 +73,7 @@ Everything lives in **6 Redis keys**:
 
 Every worker runs `promote` (move due tasks from `delayed` -> `ready`) and `reap` (recover expired leases from `leased` -> `ready` or `dlq`) on each loop iteration, so no separate scheduler process is needed.
 
----
+
 
 ## Design decisions
 
@@ -89,7 +89,7 @@ Every worker runs `promote` (move due tasks from `delayed` -> `ready`) and `reap
 - **Graceful shutdown.** The first `SIGTERM` or `SIGINT` stops the worker from leasing new tasks. The task in hand gets `SHUTDOWN_GRACE_SECONDS` to finish and is released if it doesn't. A second signal exits immediately, and the task is reaped later.
 - **Redis outages.** The client retries brief blips itself. During a longer outage the worker waits with backoff instead of crashing. `ack`, `fail` and `release` are retried for up to one lease length, because a lost ack means the task runs again.
 
----
+
 
 ## Where to read the code
 
@@ -101,7 +101,7 @@ If you want to read the implementation from start to finish, follow this order:
 4. **`src/taskq/worker.py`** — The worker loop, background heartbeat thread, and two-stage `SIGTERM` handler.
 5. **`src/taskq/producer.py` & `dlq.py`** — CLI helpers for enqueueing tasks and inspecting/retrying the DLQ.
 
----
+
 
 ## Handy commands for experimenting
 
