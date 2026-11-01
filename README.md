@@ -1,80 +1,79 @@
 # taskQ
 
-A Redis-backed task queue with leases, heartbeats, fencing tokens, retries with exponential backoff, delayed tasks, a dead letter queue, and idempotent enqueue. Every multi-key operation is an atomic Lua script. Chaos-tested with 100k tasks under worker crashes and Redis outages.
+A minimal, hackable task queue built from scratch on Redis and atomic Lua scripts.
 
-The worker runs a simulated handler (sleep, optional random failure, optional ledger charge). The point of the project is the delivery machinery around it, not a pluggable handler API.
+Most tutorials build a Redis queue with `LPUSH` and `BRPOP`. That works until a worker crashes mid-task (the task is lost), pauses during a long GC cycle (two workers run the same task), or a client retries after a network timeout (the task is enqueued twice).
 
-## Guarantees
+`taskQ` implements the machinery required to handle those failure modes cleanly: **leases, heartbeats, fencing tokens, exponential backoff with jitter, delayed scheduling, a dead-letter queue (DLQ), and idempotent enqueue**—all in ~500 lines of readable Python and 9 small Lua scripts.
 
-| Guarantees | Description |
-|---|---|
-| **Delivery** | At-least-once. A task is never lost: it ends up `completed` or in the DLQ. |
-| **Effect** | Exactly-once *effect* when the side effect is idempotent. The demo ledger achieves this with the `dedupe` guard. |
-| **Not guaranteed** | Exactly-once *execution*. A paused or partitioned worker can run a task that another worker also runs. Handlers must tolerate this. |
-| **Durability** | Redis AOF with `appendfsync everysec`: a Redis crash can lose up to ~1s of writes. |
+![Task Lifecycle](docs/lifecycle.svg)
 
-Chaos test result ([full report](docs/chaos-report.md)): 100,000 tasks plus 5,000 duplicate sends, 8 workers, and 345 injected faults (SIGKILL, SIGSTOP, SIGTERM, Redis pause and restart). All 100,000 tasks completed, none was charged twice, and the duplicate sends created no tasks.
+---
 
 ## Quick start
 
 Requires Docker and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-docker compose up -d                      # Redis 7.4 with AOF
+docker compose up -d                      # start Redis 7.4 (localhost:6379, AOF enabled)
 uv sync
-uv run python -m taskq.worker             # terminal 1 (start more for more workers)
-uv run python -m taskq.producer 10        # terminal 2
-./scripts/dashboard                       # terminal 3: live queue view
+uv run python -m taskq.worker             # terminal 1: start a worker
+uv run python -m taskq.producer 10        # terminal 2: enqueue 10 tasks
+./scripts/dashboard                       # terminal 3: live terminal UI of all queues
 ```
 
-## Architecture
+### Minimal Python usage
 
-### Task lifecycle
+You can drive the queue directly in Python via `Broker` (every method wraps a single atomic Lua script):
 
+```python
+from taskq.broker import Broker, connect
+
+broker = Broker(connect())  # connects to redis://localhost:6379/0
+
+# 1. Producer: enqueue a task (idempotency_key prevents duplicates on client retry)
+broker.enqueue(
+    "charge-42",
+    payload={"type": "charge", "account": "alice", "amount": 100},
+    idempotency_key="order-42",
+)
+
+# 2. Worker: lease a task for 10 seconds -> returns (task_id, fencing_token)
+leased = broker.lease(worker_id="worker-1", lease_seconds=10)
+if leased:
+    task_id, token = leased
+    payload = broker.payload(task_id)
+
+    # Extend the lease while working, then ack with the fencing token
+    broker.heartbeat(task_id, token, lease_seconds=10)
+    broker.ack(task_id, token)  # returns False if lease expired and another worker took over
 ```
-                 delay = 0
-  enqueue ──────────────────────────────┐
-     │ delay > 0                        ▼
-     ▼                   LPUSH    ┌──────────┐ ◄── RPUSH ── reap (lease expired, retries left)
-  delayed ── promote ───────────► │  ready   │ ◄── RPUSH ── release (graceful shutdown)
-     ▲                            └──────────┘ ◄── LPUSH ── retry_dead (manual)
-     │                                 │ lease
-     │ fail (retries left)             ▼
-     └─────────────────────────── leased ─── ack ──► completed
-                                       │
-                                       └── fail / reap (out of retries) ──► dlq
-```
 
-Workers take tasks from the right end of `queue:ready` (`RPOP`). `RPUSH` therefore puts a task at the front of the line and `LPUSH` at the back.
+---
 
-### Redis keys
+## Core mental model: Delivery vs. Side effects
 
-| Key | Type | Contents |
+| Layer | Guarantee | How it works |
 |---|---|---|
-| `queue:ready` | LIST | Task IDs that can run now |
-| `queue:leased` | ZSET | Leased task IDs, score = lease expiry |
-| `queue:delayed` | ZSET | Waiting task IDs, score = earliest run time |
-| `queue:dlq` | LIST | Task IDs that ran out of retries |
-| `task:<id>` | HASH | Task record (fields below) |
-| `idem:<key>` | STRING | Task ID created with this idempotency key. Expires after 24h. |
+| **Queue delivery** | **At-least-once** | Tasks are never silently dropped. Every task eventually reaches `completed` or `dead` (DLQ). |
+| **Queue state** | **Fenced** | Every lease increments `fencing_token`. Stale workers cannot `ack`, `fail`, or `heartbeat` a task that was re-leased to someone else. |
+| **Downstream effect** | **Exactly-once** *(with idempotency)* | A paused worker might already have written to an external DB *before* losing its lease. `ledger.py` demonstrates why downstream systems need an idempotent `dedupe` key in addition to fencing tokens. |
 
-`task:<id>` fields: `state` (`pending` / `delayed` / `running` / `completed` / `dead`), `max_retries`, `retries`, `fencing_token`, `worker`, `payload` (JSON), `idempotency_key`, `last_error`, and the timestamps `created_at`, `leased_at`, `heartbeat_at`, `run_at`, `completed_at`, `dead_at`.
+---
 
-### Lua scripts (`src/taskq/lua/`)
+## How the state machine works
 
-| Script | Does |
-|---|---|
-| `enqueue` | Creates the task record and puts the task on ready, or on delayed if `delay > 0`. A reused idempotency key returns the original task instead. |
-| `lease` | Pops from ready into leased and issues a new fencing token |
-| `heartbeat` | Extends the lease (current token holder only) |
-| `ack` | Marks the task completed (current token holder only) |
-| `fail` | Schedules a retry on delayed with backoff, or moves the task to the DLQ |
-| `release` | Returns the task to the front of ready without using a retry |
-| `reap` | Handles expired leases: counts a failed attempt, then sends the task to the front of ready or to the DLQ |
-| `promote` | Moves tasks that are due from delayed to the back of ready |
-| `retry_dead` | Moves a task from the DLQ back to ready and resets `retries` to 0 |
+Everything lives in **6 Redis keys**:
+- `queue:ready` (`LIST`): runnable task IDs. Workers `RPOP` from the right (front of the line).
+- `queue:leased` (`ZSET`): currently running task IDs, scored by lease expiration timestamp.
+- `queue:delayed` (`ZSET`): scheduled / backing-off task IDs, scored by `run_at` timestamp.
+- `queue:dlq` (`LIST`): dead task IDs that exhausted `max_retries`.
+- `task:<id>` (`HASH`): task state (`pending` / `delayed` / `running` / `completed` / `dead`), `fencing_token`, `retries`, `payload`, error history, and timestamps.
+- `idem:<key>` (`STRING`): maps an idempotency key to its `task_id` (24h TTL).
 
-Each worker runs `promote` and `reap` on every loop iteration, so the system needs no separate scheduler process.
+Every worker runs `promote` (move due tasks from `delayed` -> `ready`) and `reap` (recover expired leases from `leased` -> `ready` or `dlq`) on each loop iteration, so no separate scheduler process is needed.
+
+---
 
 ## Design decisions
 
@@ -87,131 +86,39 @@ Each worker runs `promote` and `reap` on every loop iteration, so the system nee
 - **Queue position.** A reaped or released task already reached the front of the queue once, so it goes back to the front (`RPUSH`). A promoted task only became runnable now, so it goes to the back (`LPUSH`).
 - **Backoff.** The base delay is `min(base · 2^(retries−1), cap)`. "Equal jitter" then scales it to between 50% and 100%, so tasks that failed together don't all retry at the same moment. Python generates the random number because `math.random` inside Redis scripts is not reliably random.
 - **Idempotent enqueue.** `SET idem:<key> NX EX` makes a producer that retries after a timeout reuse the original task.
-- **Graceful shutdown.** The first SIGTERM or SIGINT stops the worker from leasing new tasks. The task in hand gets `SHUTDOWN_GRACE_SECONDS` to finish and is released if it doesn't. A second signal exits immediately, and the task is reaped later.
+- **Graceful shutdown.** The first `SIGTERM` or `SIGINT` stops the worker from leasing new tasks. The task in hand gets `SHUTDOWN_GRACE_SECONDS` to finish and is released if it doesn't. A second signal exits immediately, and the task is reaped later.
 - **Redis outages.** The client retries brief blips itself. During a longer outage the worker waits with backoff instead of crashing. `ack`, `fail` and `release` are retried for up to one lease length, because a lost ack means the task runs again.
 
-## Configuration
+---
 
-### Environment variables
+## Where to read the code
 
-| Variable | Default | Used by | Meaning |
-|---|---|---|---|
-| `REDIS_URL` | `redis://localhost:6379/0` | all | Redis connection |
-| `REDIS_TIMEOUT_SECONDS` | `5` | all | Socket connect and read timeout |
-| `LEDGER_PATH` | `ledger.db` | worker, ledger | SQLite ledger file |
-| `LEASE_SECONDS` | `10` | worker | Lease length (heartbeat interval = 1/3 of it) |
-| `WORK_SECONDS` | `3` | worker | Simulated work before the side effect |
-| `AFTER_EFFECT_SECONDS` | `0` | worker | Simulated work after the side effect, before the ack |
-| `FAIL_RATE` | `0` | worker | Probability that the handler raises |
-| `LEDGER_GUARD` | `dedupe` | worker | `none` / `dedupe` / `fence` (see [Tools](#tools)) |
-| `BACKOFF_BASE_SECONDS` | `1` | worker | Backoff before the first retry |
-| `BACKOFF_MAX_SECONDS` | `60` | worker | Backoff cap |
-| `POLL_SECONDS` | `0.5` | worker | Sleep when the ready queue is empty |
-| `SHUTDOWN_GRACE_SECONDS` | `10` | worker | Time the task in hand gets on shutdown |
+If you want to read the implementation from start to finish, follow this order:
 
-Example: `WORK_SECONDS=15 LEASE_SECONDS=5 FAIL_RATE=0.5 uv run python -m taskq.worker`
+1. **`src/taskq/lua/`** — 9 short Lua scripts (`enqueue`, `lease`, `heartbeat`, `ack`, `fail`, `release`, `reap`, `promote`, `retry_dead`). This is the actual state machine.
+2. **`src/taskq/broker.py`** — Thin Python wrapper around the Lua scripts and Redis connection retry policy.
+3. **`src/taskq/ledger.py`** — SQLite stand-in for an external payment ledger comparing `none`, `fence`, and `dedupe` guards against duplicate execution.
+4. **`src/taskq/worker.py`** — The worker loop, background heartbeat thread, and two-stage `SIGTERM` handler.
+5. **`src/taskq/producer.py` & `dlq.py`** — CLI helpers for enqueueing tasks and inspecting/retrying the DLQ.
 
-### Producer
+---
 
-```
-uv run python -m taskq.producer [count] [--delay SECONDS] [--max-retries N]
-                                [--charge AMOUNT] [--idempotency-prefix PREFIX]
-```
-
-| Option | Default | Meaning |
-|---|---|---|
-| `count` | `5` | Number of tasks |
-| `--delay` | `0` | Seconds before the tasks may run |
-| `--max-retries` | `3` | Retries before a task goes to the DLQ |
-| `--charge` | none | Each task charges this amount to account `alice` in the ledger |
-| `--idempotency-prefix` | none | Gives task `i` the key `PREFIX-i`, so re-running the same command creates nothing |
-
-### Python API (`taskq.broker`)
-
-| Call | Returns |
-|---|---|
-| `connect()` | `redis.Redis` configured from the environment |
-| `Broker(r).enqueue(task_id, delay=0, max_retries=3, payload=None, idempotency_key=None, idempotency_ttl=86400)` | `Enqueued(task_id, created)` |
-| `.enqueue_many(tasks: Sequence[NewTask], batch_size=1000)` | `list[Enqueued]`, sent as pipelined batches |
-| `.lease(worker_id, lease_seconds)` | `(task_id, token)` or `None` |
-| `.heartbeat(task_id, token, lease_seconds)` | `bool`, False = lease lost |
-| `.ack(task_id, token)` | `bool`, False = stale token |
-| `.fail(task_id, token, error, backoff_base, backoff_max)` | `FailResult(status="retry" \| "dead" \| "stale", retries, delay)` |
-| `.release(task_id, token)` | `bool` |
-| `.reap(limit=100)` | `list[(task_id, "ready" \| "dead")]` |
-| `.promote(limit=100)` | `list[task_id]` |
-| `.payload(task_id)` | `dict` (`{}` if the task has no payload) |
-| `.dead()` | `list[task_id]`, most recently dead first |
-| `.retry_dead(task_id)` | `bool`, False = the task was not in the DLQ |
-
-## Tools
-
-| Command | Purpose |
-|---|---|
-| `./scripts/dashboard [--once]` | Live view of all queues with lease and run countdowns, plus DLQ errors |
-| `./scripts/rc [args]` | `redis-cli` inside the Redis container, e.g. `./scripts/rc LRANGE queue:ready 0 -1` |
-| `uv run python -m taskq.dlq` | List dead tasks with their retry counts and last errors |
-| `uv run python -m taskq.dlq retry <id> \| --all` | Send dead tasks back to ready |
-| `uv run python -m taskq.ledger` | Summarize the ledger and list tasks charged more than once |
-| `uv run python -m taskq.chaos [options]` | Chaos test (see [Testing](#testing)) |
-
-The ledger (`ledger.py`) is a SQLite stand-in for a downstream system. Its guard decides how it handles duplicate executions:
-
-- `none`: no protection. A task that runs twice charges twice.
-- `dedupe`: records each applied task in the same transaction as the charge, so a second run is a no-op.
-- `fence`: rejects writes whose token is older than the largest token already written. It cannot stop an older token that writes first.
-
-## Testing
-
-Tests run against the real Redis from `docker compose` on DB 15 (flushed around each test).
+## Handy commands for experimenting
 
 ```bash
-uv run pytest                    # everything
-uv run pytest -m "not outage"    # skip tests that stop, pause or kill the Redis container
-```
+# Simulate slow tasks (15s) with a short lease (5s) and 50% failure rate
+WORK_SECONDS=15 LEASE_SECONDS=5 FAIL_RATE=0.5 uv run python -m taskq.worker
 
-The chaos test uses DB 14 (flushed at start) and its own ledger, and writes logs to `.chaos/`:
+# Enqueue 20 tasks that charge $100 to the SQLite ledger with idempotency keys
+uv run python -m taskq.producer 20 --charge 100 --idempotency-prefix order
 
-```bash
-uv run python -m taskq.chaos --redis-faults --report docs/chaos-report.md
-```
+# Inspect the SQLite ledger and check for duplicate charges
+uv run python -m taskq.ledger
 
-| Option | Default | Meaning |
-|---|---|---|
-| `--tasks` | `100000` | Unique tasks to enqueue |
-| `--workers` | `8` | Worker processes |
-| `--resend-every` | `20` | Re-send every Nth task with the same idempotency key |
-| `--fault-interval` | `0.5` | Average seconds between faults |
-| `--redis-faults` | off | Also pause and restart the Redis container |
-| `--max-seconds` | `1800` | Stop injecting faults after this long |
-| `--drain-timeout` | `120` | Seconds to wait for all queues to drain at the end |
-| `--guard` | `dedupe` | Ledger guard for the workers (`none` makes the test fail) |
-| `--seed` | random | RNG seed |
-| `--redis-url` | `redis://localhost:6379/14` | Redis to use |
-| `--report` | none | Also write the report to this Markdown file |
+# Inspect dead tasks in the DLQ and retry them all
+uv run python -m taskq.dlq
+uv run python -m taskq.dlq retry --all
 
-## Known limitations
-
-- **Single-node Redis only.** Scripts build `task:<id>` and `idem:<key>` key names at runtime instead of receiving them in `KEYS`, so they would fail across Redis Cluster slots. Hash tags (`{taskq}:...`) would fix this.
-- **Reap has no backoff.** An expired lease counts as a failure, as in `fail`, but the task goes straight back to the front of ready instead of waiting on delayed.
-- **Task records never expire.** `task:<id>` hashes of completed and dead tasks accumulate.
-- **Enqueue without an idempotency key can duplicate.** The client retries a command whose reply was lost, so the task may be created twice.
-- **An abandoned handler may still run.** When the shutdown grace period runs out, the task is released, but its handler thread keeps running until the process exits and may still apply its side effect.
-- **A lost `lease` reply orphans the task.** If the client retries `lease`, the first leased task sits in leased until it is reaped.
-
-## Project structure
-
-```
-src/taskq/
-  broker.py     queue operations (wraps the Lua scripts)
-  worker.py     worker loop, heartbeat, shutdown, outage handling
-  producer.py   enqueue CLI
-  dlq.py        DLQ inspect/retry CLI
-  ledger.py     SQLite downstream system with duplicate guards
-  chaos.py      chaos test
-  lua/          one atomic script per operation
-scripts/        dashboard, rc (redis-cli)
-tests/          pytest suite (real Redis)
-docs/           chaos test report
-compose.yaml    Redis 7.4 with AOF
+# Run redis-cli directly inside the container
+./scripts/rc LRANGE queue:ready 0 -1
 ```
