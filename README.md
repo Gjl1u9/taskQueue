@@ -1,4 +1,4 @@
-# taskQ
+# taskQueue
 
 A minimal, hackable task queue built from scratch on Redis and atomic Lua scripts.
 
